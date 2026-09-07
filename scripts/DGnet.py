@@ -3,8 +3,16 @@
 DGnet Real Dataset Training & Execution Script - Realtime Camouflaged Target Detection
 Pure TensorFlow 2.x / Keras Implementation for Tactical Military Surveillance
 
+Supports:
+- Local Windows / Linux execution
+- Remote Hugging Face GPU Jobs (NVIDIA A100 / T4 / V100)
+- Configurable environment variable paths (DATA_DIR, CHECKPOINT_DIR, LOG_DIR, MODEL_DIR)
+- Automatic GPU hardware detection
+- Checkpoint persistence and training resumption
+
 Usage:
     python scripts/DGnet.py --train --epochs 10 --batch-size 8
+    python scripts/DGnet.py --train --resume
     python scripts/DGnet.py --evaluate
     python scripts/DGnet.py --summary --backbone mobilenet_v3_large
     python scripts/DGnet.py --export-tflite --output models/quantized/dgnet_mobilenet_v3.tflite
@@ -13,6 +21,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -22,12 +31,34 @@ import numpy as np
 import tensorflow as tf
 import yaml
 
+# Load .env file if available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # Add project root directory to python path for module imports
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.models.dgnet import DGNet, DGNetLoss, build_dgnet_model, TFGradientExtractor
+
+
+def setup_gpu_environment():
+    """Detects physical GPUs and configures TensorFlow memory growth."""
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        print(f"\n[GPU Hardware Detection] Found {len(gpus)} GPU(s):")
+        for idx, gpu in enumerate(gpus):
+            print(f"  • GPU [{idx}]: {gpu.name}")
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError as e:
+                print(f"    Notice (Memory Growth): {e}")
+    else:
+        print("\n[GPU Hardware Detection] No physical GPU detected by TensorFlow. Running on CPU.")
 
 
 def load_config(config_path: str = "params.yaml") -> dict:
@@ -40,41 +71,75 @@ def load_config(config_path: str = "params.yaml") -> dict:
     return {}
 
 
-def discover_dataset_pairs(data_dir: Path) -> Dict[str, Tuple[List[str], List[str]]]:
+def _find_dataset_splits_in_dir(target_dir: Path, valid_exts: set) -> Dict[str, Tuple[List[str], List[str]]]:
     """
-    Scans the data directory and auto-discovers matched RGB images and GT mask pairs.
-    Handles existing splits (Training, Testing) or raw image/mask folders.
+    Safely inspects a candidate directory for explicit dataset splits (Training, Testing) or image/GT folders.
+    Ignores non-dataset directories (e.g. dvc-store, .git, checkpoints) and handles disconnected FUSE mounts safely.
     """
-    valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    ignore_names = {"dvc-store", ".dvc", ".git", "__pycache__", ".cache", "raw_checkpoints", "logs", "models", "metrics"}
     splits = {}
 
-    data_dir = Path(data_dir)
-    if not data_dir.exists():
-        data_dir = PROJECT_ROOT / "data/raw/dataset-splitM"
-        if not data_dir.exists():
-            data_dir = PROJECT_ROOT / "data/raw"
+    try:
+        if not target_dir.exists() or not target_dir.is_dir():
+            return {}
+    except (OSError, PermissionError):
+        return {}
 
-    print(f"\n[Dataset Discovery] Scanning directory: {data_dir.resolve()}")
-
-    # Check for existing explicit split folders (e.g. Training, Testing, Validation)
-    split_folders = [d for d in data_dir.rglob("*") if d.is_dir() and d.name.lower() in ["training", "testing", "validation", "val", "train", "test"]]
+    # Collect directory candidates while ignoring known noise folders
+    split_folders = []
+    try:
+        for d in target_dir.rglob("*"):
+            try:
+                if any(ignored in d.parts for ignored in ignore_names):
+                    continue
+                if d.is_dir() and d.name.lower() in ["training", "testing", "validation", "val", "train", "test"]:
+                    split_folders.append(d)
+            except (OSError, PermissionError):
+                continue
+    except (OSError, PermissionError):
+        pass
 
     if split_folders:
         for split_dir in split_folders:
             split_name = split_dir.name.capitalize()
             img_dir, mask_dir = None, None
 
-            for child in split_dir.iterdir():
-                if child.is_dir():
-                    c_name = child.name.lower()
-                    if any(k in c_name for k in ["image", "images", "img", "imgs", "rgb"]):
-                        img_dir = child
-                    elif any(k in c_name for k in ["gt", "mask", "masks", "label", "labels", "groundtruth"]):
-                        mask_dir = child
+            try:
+                for child in split_dir.iterdir():
+                    try:
+                        if child.is_dir():
+                            c_name = child.name.lower()
+                            if any(k in c_name for k in ["image", "images", "img", "imgs", "rgb"]):
+                                img_dir = child
+                            elif any(k in c_name for k in ["gt", "mask", "masks", "label", "labels", "groundtruth"]):
+                                mask_dir = child
+                    except (OSError, PermissionError):
+                        continue
+            except (OSError, PermissionError):
+                continue
 
             if img_dir and mask_dir:
-                img_files = {f.stem: str(f.resolve()) for f in img_dir.glob("*") if f.suffix.lower() in valid_exts}
-                mask_files = {f.stem: str(f.resolve()) for f in mask_dir.glob("*") if f.suffix.lower() in valid_exts}
+                img_files = {}
+                mask_files = {}
+                try:
+                    for f in img_dir.glob("*"):
+                        try:
+                            if f.is_file() and f.suffix.lower() in valid_exts:
+                                img_files[f.stem] = str(f.resolve())
+                        except (OSError, PermissionError):
+                            continue
+                except (OSError, PermissionError):
+                    pass
+
+                try:
+                    for f in mask_dir.glob("*"):
+                        try:
+                            if f.is_file() and f.suffix.lower() in valid_exts:
+                                mask_files[f.stem] = str(f.resolve())
+                        except (OSError, PermissionError):
+                            continue
+                except (OSError, PermissionError):
+                    pass
 
                 common_stems = sorted(list(set(img_files.keys()).intersection(set(mask_files.keys()))))
                 paired_imgs = [img_files[stem] for stem in common_stems]
@@ -82,20 +147,27 @@ def discover_dataset_pairs(data_dir: Path) -> Dict[str, Tuple[List[str], List[st
 
                 if paired_imgs:
                     splits[split_name] = (paired_imgs, paired_masks)
-                    print(f"  • Split '{split_name}': Found {len(paired_imgs)} matched image-mask pairs.")
 
-    # Fallback: scan root directory directly if no explicit subfolders matched
+    # Fallback: scan directory directly if no explicit split folders matched
     if not splits:
         img_files = {}
         mask_files = {}
 
-        for f in data_dir.rglob("*"):
-            if f.is_file() and f.suffix.lower() in valid_exts:
-                p_str = str(f.parent.lower())
-                if any(k in p_str for k in ["image", "images", "img", "imgs", "rgb"]):
-                    img_files[f.stem] = str(f.resolve())
-                elif any(k in p_str for k in ["gt", "mask", "masks", "label", "labels"]):
-                    mask_files[f.stem] = str(f.resolve())
+        try:
+            for f in target_dir.rglob("*"):
+                try:
+                    if any(ignored in f.parts for ignored in ignore_names):
+                        continue
+                    if f.is_file() and f.suffix.lower() in valid_exts:
+                        p_str = str(f.parent.name.lower())
+                        if any(k in p_str for k in ["image", "images", "img", "imgs", "rgb"]):
+                            img_files[f.stem] = str(f.resolve())
+                        elif any(k in p_str for k in ["gt", "mask", "masks", "label", "labels", "groundtruth"]):
+                            mask_files[f.stem] = str(f.resolve())
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError):
+            pass
 
         common_stems = sorted(list(set(img_files.keys()).intersection(set(mask_files.keys()))))
         paired_imgs = [img_files[stem] for stem in common_stems]
@@ -103,9 +175,102 @@ def discover_dataset_pairs(data_dir: Path) -> Dict[str, Tuple[List[str], List[st
 
         if paired_imgs:
             splits["Default"] = (paired_imgs, paired_masks)
-            print(f"  • Default Split: Found {len(paired_imgs)} matched image-mask pairs.")
 
     return splits
+
+
+def discover_dataset_pairs(data_dir: Path) -> Dict[str, Tuple[List[str], List[str]]]:
+    """
+    Scans candidate data directories and auto-discovers matched RGB images and GT mask pairs.
+    Handles existing splits (Training, Testing) or raw image/mask folders.
+    Supports mounted Hugging Face Storage Buckets / S3 mounts (/data, /mnt/data, etc.).
+    """
+    valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    req_path = Path(data_dir)
+    candidate_paths = []
+
+    # Priority candidate paths
+    if req_path.is_absolute():
+        candidate_paths.append(req_path)
+    else:
+        candidate_paths.append(PROJECT_ROOT / req_path)
+        candidate_paths.append(req_path)
+
+    # Common mounted paths on HF Space S3 storage bucket /data
+    candidate_paths.extend([
+        Path("/data") / req_path,
+        Path("/data/data/raw/dataset-splitM"),
+        Path("/data/raw/dataset-splitM"),
+        Path("/data/dataset-splitM"),
+        Path("/data/data/raw"),
+        Path("/data/raw"),
+        Path("/data"),
+        PROJECT_ROOT / "data/raw/dataset-splitM",
+        PROJECT_ROOT / "data/raw",
+        Path("/mnt/data"),
+        Path("/bucket"),
+        Path("/hf/COD_dataset"),
+        Path("/datasets/gouravbirwaz/COD_dataset"),
+        Path("/mnt/s3"),
+    ])
+
+    # De-duplicate candidate paths while preserving order
+    seen = set()
+    unique_candidates = []
+    for cp in candidate_paths:
+        try:
+            resolved = str(cp.resolve())
+        except Exception:
+            resolved = str(cp)
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_candidates.append(cp)
+
+    for p in unique_candidates:
+        try:
+            splits = _find_dataset_splits_in_dir(p, valid_exts)
+            if splits:
+                print(f"\n[Dataset Discovery] Successfully discovered dataset at: {p.resolve()}")
+                for split_name, (imgs, masks) in splits.items():
+                    print(f"  • Split '{split_name}': Found {len(imgs)} matched image-mask pairs.")
+                return splits
+        except Exception:
+            continue
+
+    # Fallback: Check if mounted DVC store exists and run DVC checkout automatically
+    dvc_store_paths = [Path("/data/dvc-store"), Path("/data"), Path("/mnt/data/dvc-store")]
+    found_dvc_store = None
+    for dvc_p in dvc_store_paths:
+        try:
+            if dvc_p.exists() and dvc_p.is_dir():
+                found_dvc_store = dvc_p
+                break
+        except Exception:
+            continue
+
+    if found_dvc_store:
+        print(f"\n[Dataset Discovery] Attempting automatic DVC checkout from mounted store: {found_dvc_store.resolve()}...")
+        try:
+            import subprocess
+            subprocess.run(["dvc", "config", "cache.dir", str(found_dvc_store.resolve())], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["dvc", "config", "cache.type", "copy"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["dvc", "checkout", "data/raw.dvc"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["dvc", "checkout"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # Re-scan candidate paths after DVC checkout
+            for p in unique_candidates:
+                splits = _find_dataset_splits_in_dir(p, valid_exts)
+                if splits:
+                    print(f"[Dataset Discovery] Successfully restored dataset via DVC at: {p.resolve()}")
+                    for split_name, (imgs, masks) in splits.items():
+                        print(f"  • Split '{split_name}': Found {len(imgs)} matched image-mask pairs.")
+                    return splits
+        except Exception as e:
+            print(f"[Dataset Discovery] DVC checkout note: {e}")
+
+    print(f"\n[Dataset Discovery] Warning: No dataset pairs discovered across candidate paths.")
+    return {}
 
 
 SOBEL_KX = tf.constant([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], dtype=tf.float32)[:, :, np.newaxis, np.newaxis]
@@ -127,21 +292,17 @@ def compute_sobel_gradient_tf(mask: tf.Tensor) -> tf.Tensor:
 
 def parse_sample(img_path: tf.Tensor, mask_path: tf.Tensor, image_size: Tuple[int, int]) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """Reads, decodes, resizes, normalizes, and extracts Sobel edge map for an image-mask pair."""
-    # Load RGB image
     img_bytes = tf.io.read_file(img_path)
     image = tf.image.decode_image(img_bytes, channels=3, expand_animations=False)
     image = tf.image.resize(image, image_size)
-    image = tf.cast(image, tf.float32) / 255.0  # Normalize to [0, 1]
+    image = tf.cast(image, tf.float32) / 255.0
 
-    # Load Ground Truth mask
     mask_bytes = tf.io.read_file(mask_path)
     mask = tf.image.decode_image(mask_bytes, channels=1, expand_animations=False)
     mask = tf.image.resize(mask, image_size, method="nearest")
-    mask = tf.cast(mask >= 128, tf.float32)     # Clean binarization
+    mask = tf.cast(mask >= 128, tf.float32)
 
-    # Compute Ground Truth Sobel edge map
     grad_gt = compute_sobel_gradient_tf(mask)
-
     return image, mask, grad_gt
 
 
@@ -159,7 +320,7 @@ def create_tf_dataset(
         return parse_sample(img_p, mask_p, image_size=image_size)
 
     dataset = dataset.map(_map_fn, num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.cache()  # Cache raw loaded/resized tensors in RAM to avoid repeated disk reads
+    dataset = dataset.cache()
 
     if is_train:
         dataset = dataset.shuffle(buffer_size=min(len(image_paths), 1000), seed=42)
@@ -207,20 +368,31 @@ def train_dgnet(
     batch_size: int = 8,
     learning_rate: float = 0.001,
     data_dir: str = "data/raw/dataset-splitM",
+    checkpoint_dir: str = "models/raw_checkpoints",
+    log_dir: str = "metrics",
     backbone: str = "mobilenet_v3_large",
     kernel: str = "sobel",
-    lambda_grad: float = 1.5
+    lambda_grad: float = 1.5,
+    resume: bool = False
 ):
-    """Executes full model training on the dataset in data/."""
+    """Executes full model training on the dataset with checkpoint persistence and resume support."""
+    setup_gpu_environment()
+
     params = load_config("params.yaml")
     img_size = tuple(params.get("dataset", {}).get("image_size", [384, 384]))
 
-    # 1. Discover Real Dataset
-    splits = discover_dataset_pairs(Path(data_dir))
-    if not splits:
-        raise FileNotFoundError(f"No paired images and masks found in target directory: {data_dir}")
+    # Resolve configurable paths
+    data_path = Path(data_dir) if Path(data_dir).is_absolute() else PROJECT_ROOT / data_dir
+    ckpt_dir = Path(checkpoint_dir) if Path(checkpoint_dir).is_absolute() else PROJECT_ROOT / checkpoint_dir
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    metrics_log_dir = Path(log_dir) if Path(log_dir).is_absolute() else PROJECT_ROOT / log_dir
+    metrics_log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Determine train and validation splits
+    # 1. Discover Real Dataset
+    splits = discover_dataset_pairs(data_path)
+    if not splits:
+        raise FileNotFoundError(f"No paired images and masks found in target directory: {data_path.resolve()}")
+
     if "Training" in splits:
         train_imgs, train_masks = splits["Training"]
         if "Testing" in splits:
@@ -257,13 +429,52 @@ def train_dgnet(
     )
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
-    # Checkpoint setup
-    ckpt_dir = PROJECT_ROOT / "models/raw_checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_weights_path = ckpt_dir / "dgnet_best.weights.h5"
+    latest_weights_path = ckpt_dir / "dgnet_latest.weights.h5"
+    final_weights_path = ckpt_dir / "dgnet_final.weights.h5"
     best_model_path = ckpt_dir / "dgnet_best_model.keras"
-    metrics_log_path = PROJECT_ROOT / "metrics/train_metrics.json"
-    metrics_log_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_log_path = metrics_log_dir / "train_metrics.json"
+
+    # Initialize model weights shape by calling dummy forward pass
+    dummy_x = tf.zeros((1, img_size[0], img_size[1], 3))
+    _ = model(dummy_x, training=False)
+
+    # Checkpoint Resume Logic - Multi-candidate search
+    if resume:
+        candidate_dirs = [
+            ckpt_dir,
+            Path("/data/models/raw_checkpoints"),
+            Path("/app/models/raw_checkpoints"),
+            PROJECT_ROOT / "models/raw_checkpoints"
+        ]
+
+        found_weights = None
+        for cdir in candidate_dirs:
+            try:
+                if not cdir.exists():
+                    continue
+                for w_name in ["dgnet_latest.weights.h5", "dgnet_best.weights.h5", "dgnet_final.weights.h5"]:
+                    wp = cdir / w_name
+                    if wp.exists() and wp.stat().st_size > 0:
+                        found_weights = wp
+                        break
+                if found_weights:
+                    break
+                for wp in cdir.glob("*.weights.h5"):
+                    if wp.is_file() and wp.stat().st_size > 0:
+                        found_weights = wp
+                        break
+                if found_weights:
+                    break
+            except Exception:
+                continue
+
+        if found_weights:
+            print(f"\n[Resume Training] Found checkpoint weights: {found_weights.resolve()}")
+            model.load_weights(str(found_weights))
+            print("[Resume Training] Checkpoint weights loaded successfully! Continuing training...")
+        else:
+            print(f"\n[Resume Training] Notice: Resume flag set, but no checkpoint found in candidate locations. Starting fresh training.")
 
     best_val_loss = float("inf")
     history = {"train_total_loss": [], "val_total_loss": [], "val_iou": []}
@@ -302,8 +513,7 @@ def train_dgnet(
         union = tf.reduce_sum(pred_bin + y_m) - inter
         return v_loss, inter, union
 
-    # Warmup graph compilation so the user sees explicit status
-    print("\n[Training Setup] Compiling @tf.function model graph (takes ~5-10 seconds)...", flush=True)
+    print("\n[Training Setup] Compiling @tf.function model graph...", flush=True)
     for w_x, w_y, w_g in train_ds.take(1):
         _ = train_step(w_x, w_y, w_g)
         _ = val_step(w_x, w_y, w_g)
@@ -311,7 +521,7 @@ def train_dgnet(
 
     try:
         from tqdm import tqdm
-        use_tqdm = True
+        use_tqdm = sys.stdout.isatty()
     except ImportError:
         use_tqdm = False
 
@@ -324,7 +534,6 @@ def train_dgnet(
         train_loss_sum = 0.0
         num_batches = 0
 
-        # Training Epoch Loop
         if use_tqdm:
             pbar = tqdm(train_ds, total=total_train_batches, desc=f"Epoch {epoch:02d}/{epochs:02d} [Train]", leave=False)
             for x_batch, y_mask, y_grad in pbar:
@@ -345,7 +554,6 @@ def train_dgnet(
 
         avg_train_loss = train_loss_sum / num_batches if num_batches > 0 else 0.0
 
-        # Validation Epoch Loop
         val_loss_sum = 0.0
         val_batches = 0
         intersection_sum = 0.0
@@ -375,12 +583,17 @@ def train_dgnet(
         history["val_total_loss"].append(avg_val_loss)
         history["val_iou"].append(val_iou)
 
-        # Checkpoint Saving
+        # Always update latest weights checkpoint after each epoch
+        try:
+            model.save_weights(str(latest_weights_path))
+        except Exception as e:
+            print(f"  Notice (Checkpoint Save): {e}")
+
         saved_str = ""
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            model.save_weights(str(best_weights_path))
             try:
+                model.save_weights(str(best_weights_path))
                 model.save(str(best_model_path))
             except Exception:
                 pass
@@ -388,25 +601,53 @@ def train_dgnet(
 
         print(f"Epoch [{epoch:02d}/{epochs:02d}] ({epoch_time:.1f}s) | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val IoU: {val_iou:.4f}{saved_str}", flush=True)
 
+        with open(metrics_log_path, "w") as f:
+            json.dump(history, f, indent=4)
+
+    # Save final checkpoint
+    try:
+        model.save_weights(str(final_weights_path))
+        if not best_weights_path.exists() and latest_weights_path.exists():
+            shutil.copy2(str(latest_weights_path), str(best_weights_path))
+    except Exception as e:
+        print(f"[Checkpoint Save] Note: {e}")
+
+    # Sync checkpoints to local models/raw_checkpoints if saved elsewhere
+    fallback_ckpt_dir = PROJECT_ROOT / "models/raw_checkpoints"
+    if ckpt_dir.resolve() != fallback_ckpt_dir.resolve():
+        fallback_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        for w_file in [latest_weights_path, best_weights_path, final_weights_path]:
+            if w_file.exists():
+                try:
+                    shutil.copy2(str(w_file), str(fallback_ckpt_dir / w_file.name))
+                except Exception:
+                    pass
+
     total_training_time = time.time() - start_train_time
     print("=" * 70)
     print(f" Training Completed in {total_training_time / 60.0:.2f} minutes!")
     print(f" Best Validation Loss: {best_val_loss:.4f}")
-    print(f" Checkpoint Location:  {best_weights_path.resolve()}")
+    print(f" Checkpoint Location:  {ckpt_dir.resolve()}")
     print("=" * 70 + "\n")
 
-    # Save metrics log
     with open(metrics_log_path, "w") as f:
         json.dump(history, f, indent=4)
     print(f"[Metrics] Saved training history to: {metrics_log_path.resolve()}\n")
 
 
-def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", backbone: str = "mobilenet_v3_large", kernel: str = "sobel"):
+def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", checkpoint_dir: str = "models/raw_checkpoints", log_dir: str = "metrics", backbone: str = "mobilenet_v3_large", kernel: str = "sobel"):
     """Evaluates the trained model on test dataset split."""
+    setup_gpu_environment()
+
     params = load_config("params.yaml")
     img_size = tuple(params.get("dataset", {}).get("image_size", [384, 384]))
 
-    splits = discover_dataset_pairs(Path(data_dir))
+    data_path = Path(data_dir) if Path(data_dir).is_absolute() else PROJECT_ROOT / data_dir
+    ckpt_dir = Path(checkpoint_dir) if Path(checkpoint_dir).is_absolute() else PROJECT_ROOT / checkpoint_dir
+    metrics_log_dir = Path(log_dir) if Path(log_dir).is_absolute() else PROJECT_ROOT / log_dir
+    metrics_log_dir.mkdir(parents=True, exist_ok=True)
+
+    splits = discover_dataset_pairs(data_path)
     test_key = "Testing" if "Testing" in splits else list(splits.keys())[0]
     test_imgs, test_masks = splits[test_key]
 
@@ -414,15 +655,35 @@ def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", backbone: str = "m
     test_ds = create_tf_dataset(test_imgs, test_masks, image_size=img_size, batch_size=4, is_train=False)
 
     model = build_dgnet_model(backbone_name=backbone, input_shape=(img_size[0], img_size[1], 3), gradient_kernel=kernel, pretrained=False)
-    best_weights_path = PROJECT_ROOT / "models/raw_checkpoints/dgnet_best.weights.h5"
 
-    if best_weights_path.exists():
+    # Multi-candidate search for weights
+    candidate_dirs = [
+        ckpt_dir,
+        Path("/data/models/raw_checkpoints"),
+        Path("/app/models/raw_checkpoints"),
+        PROJECT_ROOT / "models/raw_checkpoints"
+    ]
+    found_weights = None
+    for cdir in candidate_dirs:
+        try:
+            if not cdir.exists():
+                continue
+            for w_name in ["dgnet_best.weights.h5", "dgnet_latest.weights.h5", "dgnet_final.weights.h5"]:
+                wp = cdir / w_name
+                if wp.exists() and wp.stat().st_size > 0:
+                    found_weights = wp
+                    break
+            if found_weights:
+                break
+        except Exception:
+            continue
+
+    if found_weights:
         _ = model(tf.zeros((1, img_size[0], img_size[1], 3)), training=False)
-        model.load_weights(str(best_weights_path))
-        print(f"[Evaluation] Loaded weights from: {best_weights_path.resolve()}")
+        model.load_weights(str(found_weights))
+        print(f"[Evaluation] Loaded weights from: {found_weights.resolve()}")
     else:
-        print("[Evaluation] Warning: No trained weights checkpoint found. Evaluating with initialized model.")
-
+        print(f"[Evaluation] Warning: No trained weights checkpoint found. Evaluating with initialized model.")
 
     mae_sum = 0.0
     count = 0
@@ -445,8 +706,7 @@ def evaluate_dgnet(data_dir: str = "data/raw/dataset-splitM", backbone: str = "m
         "evaluation_fps": round(fps, 1)
     }
 
-    eval_log_path = PROJECT_ROOT / "metrics/evaluation_results.json"
-    eval_log_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_log_path = metrics_log_dir / "evaluation_results.json"
     with open(eval_log_path, "w") as f:
         json.dump(eval_results, f, indent=4)
 
@@ -467,7 +727,7 @@ def export_tflite(
     quantize_int8: bool = False
 ):
     """Exports DGNet to TensorFlow Lite (.tflite) for edge deployment on Jetson / ARM / Raspberry Pi."""
-    output_file = PROJECT_ROOT / output_path
+    output_file = Path(output_path) if Path(output_path).is_absolute() else PROJECT_ROOT / output_path
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"\n[Export] Exporting DGNet (Backbone: {model.backbone_name}) to TFLite format...")
@@ -501,6 +761,14 @@ def main():
     params = load_config("params.yaml")
     model_cfg = params.get("model", {})
     train_cfg = params.get("train", {})
+
+    # Priority: Env Vars > Config Params > Default relative paths
+    env_data_dir = os.getenv("DATA_DIR", "data/raw/dataset-splitM")
+    env_model_dir = os.getenv("MODEL_DIR", "models")
+    env_ckpt_dir = os.getenv("CHECKPOINT_DIR", "models/raw_checkpoints")
+    env_log_dir = os.getenv("LOG_DIR", "metrics")
+    env_resume = os.getenv("RESUME", "false").lower() in ("true", "1", "t", "yes")
+
     default_backbone = model_cfg.get("context_backbone", "mobilenet_v3_large")
     default_kernel = model_cfg.get("gradient_kernel", "sobel")
     default_img_size = tuple(params.get("dataset", {}).get("image_size", [384, 384]))
@@ -509,14 +777,18 @@ def main():
     default_lr = train_cfg.get("learning_rate", 0.001)
 
     parser = argparse.ArgumentParser(description="DGNet: Deep Gradient Network Real Model Training & Execution (TensorFlow 2.x)")
-    parser.add_argument("--train", action="store_true", help="Execute real model training on dataset in data/")
+    parser.add_argument("--train", action="store_true", help="Execute real model training on dataset")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate trained model on test dataset split")
-    parser.add_argument("--backbone", type=str, default=default_backbone, help="Backbone architecture (mobilenet_v3_large, mobilenet_v3_small, mobilenet_v2, efficientnet-b0, resnet50)")
-    parser.add_argument("--kernel", type=str, default=default_kernel, help="Gradient kernel type (sobel, scharr, laplacian)")
+    parser.add_argument("--resume", action="store_true", default=env_resume, help="Resume training from latest checkpoint in CHECKPOINT_DIR")
+    parser.add_argument("--backbone", type=str, default=default_backbone, help="Backbone architecture")
+    parser.add_argument("--kernel", type=str, default=default_kernel, help="Gradient kernel type")
     parser.add_argument("--epochs", type=int, default=default_epochs, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=default_batch_size, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=default_lr, help="Learning rate")
-    parser.add_argument("--data-dir", type=str, default="data/raw/dataset-splitM", help="Path to data directory")
+    parser.add_argument("--data-dir", type=str, default=env_data_dir, help="Path to data directory (or via DATA_DIR env var)")
+    parser.add_argument("--checkpoint-dir", type=str, default=env_ckpt_dir, help="Path to checkpoint directory (or via CHECKPOINT_DIR env var)")
+    parser.add_argument("--log-dir", type=str, default=env_log_dir, help="Path to metrics/log directory (or via LOG_DIR env var)")
+    parser.add_argument("--model-dir", type=str, default=env_model_dir, help="Path to model directory (or via MODEL_DIR env var)")
     parser.add_argument("--summary", action="store_true", help="Print model summary and parameter stats")
     parser.add_argument("--export-tflite", action="store_true", help="Export model to TensorFlow Lite format")
     parser.add_argument("--output", type=str, default=None, help="Custom output filepath for export/checkpoint")
@@ -532,13 +804,18 @@ def main():
             batch_size=args.batch_size,
             learning_rate=args.lr,
             data_dir=args.data_dir,
+            checkpoint_dir=args.checkpoint_dir,
+            log_dir=args.log_dir,
             backbone=args.backbone,
-            kernel=args.kernel
+            kernel=args.kernel,
+            resume=args.resume
         )
 
     if args.evaluate:
         evaluate_dgnet(
             data_dir=args.data_dir,
+            checkpoint_dir=args.checkpoint_dir,
+            log_dir=args.log_dir,
             backbone=args.backbone,
             kernel=args.kernel
         )
@@ -559,7 +836,7 @@ def main():
             gradient_kernel=args.kernel,
             pretrained=False
         )
-        out_path = args.output if args.output else "models/quantized/dgnet_mobilenet_v3.tflite"
+        out_path = args.output if args.output else os.path.join(args.model_dir, "quantized/dgnet_mobilenet_v3.tflite")
         export_tflite(model, output_path=out_path, image_size=default_img_size)
 
 
